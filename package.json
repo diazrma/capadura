@@ -4,11 +4,15 @@
   "description": "Capa Dura — estante de livros social: escaneie o código de barras, organize a estante e descubra seu DNA literário",
   "main": "server.js",
   "scripts": {
-    "start": "node --experimental-sqlite --no-warnings --env-file-if-exists=.env server.js",
+    "start": "node --no-warnings --env-file-if-exists=.env server.js",
     "cert": "mkdir -p certs && openssl req -x509 -newkey rsa:2048 -nodes -keyout certs/key.pem -out certs/cert.pem -days 365 -subj /CN=estante.local"
   },
   "dependencies": {
+    "@libsql/client": "^0.14.0",
     "express": "^4.21.2",
-    "sharp": "^0.33.5"
+    "sharp": "^0.35.5"
+  },
+  "engines": {
+    "node": "22.x"
   }
 }

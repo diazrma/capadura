@@ -4,8 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
-const { DatabaseSync } = require('node:sqlite');
 const sharp = require('sharp');
+const db = require('./db');
 const { shelfImage } = require('./og');
 const { ensureCover, forgetCover, warmCovers, onCoverResult } = require('./covers');
 
@@ -21,8 +21,9 @@ const TEXT_MODELS = modelList(
 const VISION_MODELS = modelList(process.env.GROQ_VISION_MODEL, process.env.GROQ_VISION_MODELS || 'qwen/qwen3.8-27b');
 
 // ---------- Banco de dados ----------
-const db = new DatabaseSync(process.env.DB_PATH || path.join(__dirname, 'estante.db'));
-db.exec(`
+// Cria as tabelas e aplica as migrações uma vez por processo (na Vercel, a cada "cold start")
+async function initDb() {
+await db.exec(`
   PRAGMA journal_mode = WAL;
   PRAGMA foreign_keys = ON;
   CREATE TABLE IF NOT EXISTS users (
@@ -113,29 +114,32 @@ for (const sql of [
   "ALTER TABLE users ADD COLUMN shelf_style TEXT DEFAULT 'nogueira'",
   "ALTER TABLE books ADD COLUMN format TEXT DEFAULT 'fisico'",
   "ALTER TABLE users ADD COLUMN banner TEXT DEFAULT ''", // '' = automática (capas da estante) | 'preset:<nome>' | 'foto:<versão>'
+  "ALTER TABLE users ADD COLUMN banner_img TEXT DEFAULT ''", // foto da capa do perfil (JPEG em data URL, guardada no banco)
 ]) {
   try {
-    db.exec(sql);
+    await db.exec(sql);
   } catch {}
 }
-db.exec('CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub ON users(google_sub)');
-db.exec("UPDATE users SET shelf_style = 'rgb' WHERE shelf_style = 'neon'"); // o modelo Neon virou RGB
-onCoverResult((id, ok) => db.prepare('UPDATE books SET cover_ok = ? WHERE id = ?').run(ok ? 1 : 0, id));
+await db.exec('CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub ON users(google_sub)');
+await db.exec("UPDATE users SET shelf_style = 'rgb' WHERE shelf_style = 'neon'"); // o modelo Neon virou RGB
+}
+const ready = initDb();
+onCoverResult((id, ok) => db.prepare('UPDATE books SET cover_ok = ? WHERE id = ?').run(ok ? 1 : 0, id).catch(() => {}));
 
 // ---------- Notificações ----------
 // Avisa o dono do livro (ou a pessoa seguida). Ninguém é notificado das próprias ações;
 // a mesma ação repetida (ex.: nova nota) só atualiza o aviso existente.
-function notify(type, actorId, { bookId = null, userId = null, extra = '' } = {}) {
-  const to = userId ?? db.prepare('SELECT user_id FROM books WHERE id = ?').get(bookId)?.user_id;
+async function notify(type, actorId, { bookId = null, userId = null, extra = '' } = {}) {
+  const to = userId ?? await db.prepare('SELECT user_id FROM books WHERE id = ?').get(bookId)?.user_id;
   if (!to || to === actorId) return;
   if (type !== 'comment') {
-    db.prepare('DELETE FROM notifications WHERE user_id = ? AND actor_id = ? AND type = ? AND book_id IS ?').run(to, actorId, type, bookId);
+    await db.prepare('DELETE FROM notifications WHERE user_id = ? AND actor_id = ? AND type = ? AND book_id IS ?').run(to, actorId, type, bookId);
   }
-  db.prepare('INSERT INTO notifications (user_id, actor_id, type, book_id, extra) VALUES (?, ?, ?, ?, ?)').run(to, actorId, type, bookId, String(extra).slice(0, 140));
+  await db.prepare('INSERT INTO notifications (user_id, actor_id, type, book_id, extra) VALUES (?, ?, ?, ?, ?)').run(to, actorId, type, bookId, String(extra).slice(0, 140));
 }
-function unnotify(type, actorId, { bookId = null, userId = null } = {}) {
-  const to = userId ?? db.prepare('SELECT user_id FROM books WHERE id = ?').get(bookId)?.user_id;
-  if (to) db.prepare('DELETE FROM notifications WHERE user_id = ? AND actor_id = ? AND type = ? AND book_id IS ?').run(to, actorId, type, bookId);
+async function unnotify(type, actorId, { bookId = null, userId = null } = {}) {
+  const to = userId ?? await db.prepare('SELECT user_id FROM books WHERE id = ?').get(bookId)?.user_id;
+  if (to) await db.prepare('DELETE FROM notifications WHERE user_id = ? AND actor_id = ? AND type = ? AND book_id IS ?').run(to, actorId, type, bookId);
 }
 
 // ---------- Senhas e sessões ----------
@@ -166,17 +170,31 @@ function setSessionCookie(res, token, secure) {
 
 // ---------- App ----------
 const app = express();
+for (const method of ['get', 'post', 'put', 'delete']) {
+  const original = app[method].bind(app);
+  app[method] = (route, ...handlers) =>
+    handlers.length
+      ? original(route, ...handlers.map((h) => (typeof h === 'function' && h.length < 4 ? (req, res, next) => Promise.resolve(h(req, res, next)).catch(next) : h)))
+      : original(route); // app.get('configuração')
+}
+// atrás do proxy https da hospedagem (Railway, Render etc.): req.secure fica correto e o cookie de login sai com Secure
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '8mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-app.use((req, res, next) => {
-  const { sid } = parseCookies(req.headers.cookie);
-  if (sid) {
-    req.user = db
-      .prepare('SELECT u.id, u.username, u.name, u.bio, u.avatar, u.shelf_style FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?')
-      .get(sid);
+app.use(async (req, res, next) => {
+  try {
+    await ready;
+    const { sid } = parseCookies(req.headers.cookie);
+    if (sid) {
+      req.user = await db
+        .prepare('SELECT u.id, u.username, u.name, u.bio, u.avatar, u.shelf_style FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?')
+        .get(sid);
+    }
+    next();
+  } catch (err) {
+    next(err);
   }
-  next();
 });
 
 function requireAuth(req, res, next) {
@@ -191,7 +209,7 @@ const wrap = (fn) => (req, res) => Promise.resolve(fn(req, res)).catch((err) => 
 });
 
 // ----- Autenticação -----
-app.post('/api/register', (req, res) => {
+app.post('/api/register', async (req, res) => {
   const username = String(req.body.username || '').trim().toLowerCase();
   const name = String(req.body.name || '').trim();
   const password = String(req.body.password || '');
@@ -200,33 +218,33 @@ app.post('/api/register', (req, res) => {
   }
   if (!name) return res.status(400).json({ error: 'Informe seu nome.' });
   if (password.length < 6) return res.status(400).json({ error: 'A senha precisa ter pelo menos 6 caracteres.' });
-  if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) {
+  if (await db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) {
     return res.status(409).json({ error: 'Esse usuário já existe.' });
   }
-  const { lastInsertRowid } = db
+  const { lastInsertRowid } = await db
     .prepare('INSERT INTO users (username, name, password_hash) VALUES (?, ?, ?)')
     .run(username, name, hashPassword(password));
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, lastInsertRowid);
+  await db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, lastInsertRowid);
   setSessionCookie(res, token, req.secure);
   res.json({ user: { id: Number(lastInsertRowid), username, name, bio: '', avatar: '', shelf_style: 'nogueira' } });
 });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   const username = String(req.body.username || '').trim().toLowerCase();
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  const user = await db.prepare('SELECT * FROM users WHERE username = ?').get(username);
   if (!user || !checkPassword(String(req.body.password || ''), user.password_hash)) {
     return res.status(401).json({ error: 'Usuário ou senha incorretos.' });
   }
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, user.id);
+  await db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, user.id);
   setSessionCookie(res, token, req.secure);
   res.json({ user: { id: user.id, username: user.username, name: user.name, bio: user.bio, avatar: user.avatar, shelf_style: user.shelf_style } });
 });
 
-app.post('/api/logout', (req, res) => {
+app.post('/api/logout', async (req, res) => {
   const { sid } = parseCookies(req.headers.cookie);
-  if (sid) db.prepare('DELETE FROM sessions WHERE token = ?').run(sid);
+  if (sid) await db.prepare('DELETE FROM sessions WHERE token = ?').run(sid);
   res.setHeader('Set-Cookie', 'sid=; Path=/; Max-Age=0');
   res.json({ ok: true });
 });
@@ -236,17 +254,17 @@ app.get('/api/me', (req, res) => res.json({ user: req.user || null }));
 app.get('/api/config', (req, res) => res.json({ googleClientId: process.env.GOOGLE_CLIENT_ID || null }));
 
 // ----- Login com Google -----
-function startSession(req, res, userId) {
+async function startSession(req, res, userId) {
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, userId);
+  await db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, userId);
   setSessionCookie(res, token, req.secure);
 }
 
-function uniqueUsername(base) {
+async function uniqueUsername(base) {
   base = base.toLowerCase().normalize('NFD').replace(/[^a-z0-9_.]/g, '').slice(0, 16) || 'leitor';
   if (base.length < 3) base = `${base}leitor`;
   let name = base;
-  for (let i = 2; db.prepare('SELECT 1 FROM users WHERE username = ?').get(name); i++) name = `${base}${i}`;
+  for (let i = 2; await db.prepare('SELECT 1 FROM users WHERE username = ?').get(name); i++) name = `${base}${i}`;
   return name;
 }
 
@@ -259,23 +277,20 @@ app.post('/api/auth/google', wrap(async (req, res) => {
   if (!info || info.aud !== clientId || !['accounts.google.com', 'https://accounts.google.com'].includes(info.iss)) {
     return res.status(401).json({ error: 'Não foi possível confirmar sua conta Google.' });
   }
-  let user = db.prepare('SELECT * FROM users WHERE google_sub = ?').get(info.sub);
+  let user = await db.prepare('SELECT * FROM users WHERE google_sub = ?').get(info.sub);
   if (!user) {
-    const username = uniqueUsername(String(info.email || '').split('@')[0]);
-    const { lastInsertRowid } = db
+    const username = await uniqueUsername(String(info.email || '').split('@')[0]);
+    const { lastInsertRowid } = await db
       .prepare('INSERT INTO users (username, name, password_hash, google_sub, email, avatar) VALUES (?, ?, ?, ?, ?, ?)')
       .run(username, info.name || username, '', info.sub, info.email || '', info.picture || '');
-    user = db.prepare('SELECT * FROM users WHERE id = ?').get(lastInsertRowid);
+    user = await db.prepare('SELECT * FROM users WHERE id = ?').get(lastInsertRowid);
   }
-  startSession(req, res, user.id);
+  await startSession(req, res, user.id);
   res.json({ user: { id: user.id, username: user.username, name: user.name, bio: user.bio, avatar: user.avatar, shelf_style: user.shelf_style } });
 }));
 
 // ----- Capa (banner) do perfil -----
-const BANNER_DIR = process.env.DB_PATH ? path.join(path.dirname(process.env.DB_PATH), 'banners') : path.join(__dirname, 'data', 'banners');
-fs.mkdirSync(BANNER_DIR, { recursive: true });
 const BANNER_PRESETS = ['por-do-sol', 'floresta', 'oceano', 'noite', 'biblioteca', 'papel', 'aurora', 'cafe'];
-const bannerFile = (userId) => path.join(BANNER_DIR, `${Number(userId)}.jpg`);
 // o que o site recebe: link da foto, nome do modelo ou '' (automática)
 const bannerOut = (u) =>
   String(u.banner || '').startsWith('foto:') ? `/api/users/${encodeURIComponent(u.username)}/banner.jpg?v=${u.banner.slice(5)}` : u.banner || '';
@@ -286,32 +301,32 @@ app.put('/api/me/banner', requireAuth, wrap(async (req, res) => {
   if (image) {
     const m = String(image).match(/^data:image\/[a-z+.-]+;base64,(.+)$/);
     if (!m || image.length > 12_000_000) return res.status(400).json({ error: 'Imagem inválida ou muito grande.' });
+    let jpeg;
     try {
-      await sharp(Buffer.from(m[1], 'base64')).rotate().resize(1600, 520, { fit: 'cover', position: 'attention' }).jpeg({ quality: 84, mozjpeg: true }).toFile(bannerFile(req.user.id));
+      jpeg = await sharp(Buffer.from(m[1], 'base64')).rotate().resize(1600, 520, { fit: 'cover', position: 'attention' }).jpeg({ quality: 82, mozjpeg: true }).toBuffer();
     } catch {
       return res.status(400).json({ error: 'Não consegui abrir essa imagem. Tente outra foto.' });
     }
+    await db.prepare('UPDATE users SET banner_img = ? WHERE id = ?').run(`data:image/jpeg;base64,${jpeg.toString('base64')}`, req.user.id);
     value = `foto:${Date.now().toString(36)}`;
   } else if (preset) {
     if (!BANNER_PRESETS.includes(preset)) return res.status(400).json({ error: 'Modelo de capa inválido.' });
     value = `preset:${preset}`;
-    fs.rmSync(bannerFile(req.user.id), { force: true });
-  } else {
-    fs.rmSync(bannerFile(req.user.id), { force: true });
   }
-  db.prepare('UPDATE users SET banner = ? WHERE id = ?').run(value, req.user.id);
+  await db.prepare(`UPDATE users SET banner = ?${value.startsWith('foto:') ? '' : ", banner_img = ''"} WHERE id = ?`).run(value, req.user.id);
   res.json({ banner: bannerOut({ username: req.user.username, banner: value }) });
 }));
 
-app.get('/api/users/:username/banner.jpg', (req, res) => {
-  const u = db.prepare('SELECT id FROM users WHERE username = ?').get(req.params.username);
-  const file = u && bannerFile(u.id);
-  if (!file || !fs.existsSync(file)) return res.status(404).end();
+app.get('/api/users/:username/banner.jpg', async (req, res) => {
+  const u = await db.prepare('SELECT banner_img FROM users WHERE username = ?').get(req.params.username);
+  const m = String(u?.banner_img || '').match(/^data:image\/jpeg;base64,(.+)$/);
+  if (!m) return res.status(404).end();
+  res.setHeader('Content-Type', 'image/jpeg');
   res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
-  res.sendFile(file);
+  res.end(Buffer.from(m[1], 'base64'));
 });
 
-app.put('/api/me', requireAuth, (req, res) => {
+app.put('/api/me', requireAuth, async (req, res) => {
   const name = String(req.body.name || '').trim() || req.user.name;
   const bio = req.body.bio === undefined ? req.user.bio : String(req.body.bio).slice(0, 280);
   let avatar = req.user.avatar || '';
@@ -323,7 +338,7 @@ app.put('/api/me', requireAuth, (req, res) => {
   }
   const SHELF_STYLES = ['nogueira', 'carvalho', 'rustica', 'branca', 'industrial', 'rgb', 'classica', 'escandinava', 'pintada'];
   const shelf_style = SHELF_STYLES.includes(req.body.shelf_style) ? req.body.shelf_style : req.user.shelf_style || 'nogueira';
-  db.prepare('UPDATE users SET name = ?, bio = ?, avatar = ?, shelf_style = ? WHERE id = ?').run(name, bio, avatar, shelf_style, req.user.id);
+  await db.prepare('UPDATE users SET name = ?, bio = ?, avatar = ?, shelf_style = ? WHERE id = ?').run(name, bio, avatar, shelf_style, req.user.id);
   res.json({ user: { ...req.user, name, bio, avatar, shelf_style } });
 });
 
@@ -580,7 +595,7 @@ function bookFields(b) {
   };
 }
 
-app.post('/api/books', requireAuth, (req, res) => {
+app.post('/api/books', requireAuth, async (req, res) => {
   let f;
   try {
     f = bookFields(req.body || {});
@@ -588,24 +603,24 @@ app.post('/api/books', requireAuth, (req, res) => {
     return res.status(err.status || 400).json({ error: err.message });
   }
   if (!f.title) return res.status(400).json({ error: 'O título é obrigatório.' });
-  const { lastInsertRowid } = db
+  const { lastInsertRowid } = await db
     .prepare(
       `INSERT INTO books (user_id, isbn, title, authors, description, cover_url, genre, year, publisher, pages, format, position)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MIN(position), 0) - 1 FROM books WHERE user_id = ?))`
     )
     .run(req.user.id, f.isbn, f.title, f.authors, f.description, f.cover_url, f.genre, f.year, f.publisher, f.pages, f.format, req.user.id);
   ensureCover(Number(lastInsertRowid), f.cover_url);
-  res.json({ book: db.prepare(`${BOOK_SELECT} WHERE b.id = ?`).get(req.user.id, req.user.id, lastInsertRowid) });
+  res.json({ book: await db.prepare(`${BOOK_SELECT} WHERE b.id = ?`).get(req.user.id, req.user.id, lastInsertRowid) });
 });
 
 // Pesquisa nos livros de todas as estantes
-app.get('/api/books', (req, res) => {
+app.get('/api/books', async (req, res) => {
   const me = req.user?.id ?? 0;
   const q = String(req.query.q || '').trim();
   if (!q) return res.json({ books: [] });
   const like = `%${q}%`;
   const digits = q.replace(/\D/g, '');
-  const books = db
+  const books = await db
     .prepare(
       `${BOOK_SELECT} WHERE b.title LIKE ? OR b.authors LIKE ? OR b.genre LIKE ? OR (length(?) >= 8 AND b.isbn = ?) OR b.publisher LIKE ?
        ORDER BY (b.title LIKE ?) DESC, like_count DESC, b.created_at DESC LIMIT 80`
@@ -614,43 +629,36 @@ app.get('/api/books', (req, res) => {
   res.json({ books });
 });
 
-app.get('/api/books/:id', (req, res) => {
-  const book = db.prepare(`${BOOK_SELECT} WHERE b.id = ?`).get(req.user?.id ?? 0, req.user?.id ?? 0, req.params.id);
+app.get('/api/books/:id', async (req, res) => {
+  const book = await db.prepare(`${BOOK_SELECT} WHERE b.id = ?`).get(req.user?.id ?? 0, req.user?.id ?? 0, req.params.id);
   if (!book) return res.status(404).json({ error: 'Livro não encontrado.' });
-  const comments = db
+  const comments = await db
     .prepare(
       `SELECT c.id, c.text, c.created_at, c.user_id, u.username, u.name, u.avatar
        FROM comments c JOIN users u ON u.id = c.user_id WHERE c.book_id = ? ORDER BY c.created_at ASC, c.id ASC`
     )
     .all(book.id);
-  const fav = db
+  const fav = await db
     .prepare(
       `SELECT (SELECT COUNT(*) FROM favorites WHERE book_id = ?) AS n,
               EXISTS(SELECT 1 FROM favorites WHERE book_id = ? AND user_id = ?) AS mine`
     )
     .get(book.id, book.id, req.user?.id ?? 0);
-  const mine = db.prepare('SELECT stars FROM ratings WHERE book_id = ? AND user_id = ?').get(book.id, req.user?.id ?? 0);
+  const mine = await db.prepare('SELECT stars FROM ratings WHERE book_id = ? AND user_id = ?').get(book.id, req.user?.id ?? 0);
   res.json({ book: { ...book, favorite_count: fav.n, favorited: Boolean(fav.mine), my_rating: mine?.stars || 0 }, comments });
 });
 
 // Salva a nova ordem dos livros na estante do usuário (livro novo entra na frente)
-app.put('/api/books/order', requireAuth, (req, res) => {
+app.put('/api/books/order', requireAuth, async (req, res) => {
   const ids = Array.isArray(req.body.ids) ? req.body.ids.map(Number).filter(Number.isInteger) : [];
-  const owned = new Set(db.prepare('SELECT id FROM books WHERE user_id = ?').all(req.user.id).map((r) => r.id));
+  const owned = new Set((await db.prepare('SELECT id FROM books WHERE user_id = ?').all(req.user.id)).map((r) => r.id));
   if (!ids.length || ids.some((id) => !owned.has(id))) return res.status(400).json({ error: 'Ordem inválida.' });
-  const update = db.prepare('UPDATE books SET position = ? WHERE id = ? AND user_id = ?');
-  db.exec('BEGIN');
-  try {
-    ids.forEach((id, i) => update.run(i, id, req.user.id));
-    db.exec('COMMIT');
-  } catch (err) {
-    db.exec('ROLLBACK');
-    throw err;
-  }
+  // tudo de uma vez (ou nada)
+  await db.batch(ids.map((id, i) => ['UPDATE books SET position = ? WHERE id = ? AND user_id = ?', [i, id, req.user.id]]));
   res.json({ ok: true });
 });
 
-app.put('/api/books/:id', requireAuth, (req, res) => {
+app.put('/api/books/:id', requireAuth, async (req, res) => {
   let f;
   try {
     f = bookFields(req.body || {});
@@ -658,42 +666,42 @@ app.put('/api/books/:id', requireAuth, (req, res) => {
     return res.status(err.status || 400).json({ error: err.message });
   }
   if (!f.title) return res.status(400).json({ error: 'O título é obrigatório.' });
-  const old = db.prepare('SELECT cover_url FROM books WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
+  const old = await db.prepare('SELECT cover_url FROM books WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
   if (!old) return res.status(404).json({ error: 'Livro não encontrado.' });
   if (f.cover_url.startsWith('/api/books/')) f.cover_url = old.cover_url || '';
   const coverChanged = f.cover_url !== (old.cover_url || '');
-  db.prepare(
+  await db.prepare(
     `UPDATE books SET isbn = ?, title = ?, authors = ?, description = ?, cover_url = ?, genre = ?, year = ?, publisher = ?, pages = ?,
        format = ?, cover_v = COALESCE(cover_v, 0) + ?
      WHERE id = ? AND user_id = ?`
   ).run(f.isbn, f.title, f.authors, f.description, f.cover_url, f.genre, f.year, f.publisher, f.pages, f.format, coverChanged ? 1 : 0, req.params.id, req.user.id);
   if (coverChanged) {
-    db.prepare('UPDATE books SET cover_ok = NULL WHERE id = ?').run(req.params.id);
+    await db.prepare('UPDATE books SET cover_ok = NULL WHERE id = ?').run(req.params.id);
     forgetCover(req.params.id);
     ensureCover(Number(req.params.id), f.cover_url);
   }
-  res.json({ book: db.prepare(`${BOOK_SELECT} WHERE b.id = ?`).get(req.user.id, req.user.id, req.params.id) });
+  res.json({ book: await db.prepare(`${BOOK_SELECT} WHERE b.id = ?`).get(req.user.id, req.user.id, req.params.id) });
 });
 
 // Nota de 1 a 5 estrelas (0 remove a nota)
-app.post('/api/books/:id/rating', requireAuth, (req, res) => {
+app.post('/api/books/:id/rating', requireAuth, async (req, res) => {
   const stars = Math.round(Number(req.body.stars));
   if (!(stars >= 0 && stars <= 5)) return res.status(400).json({ error: 'Nota inválida.' });
-  if (!db.prepare('SELECT 1 FROM books WHERE id = ?').get(req.params.id)) {
+  if (!await db.prepare('SELECT 1 FROM books WHERE id = ?').get(req.params.id)) {
     return res.status(404).json({ error: 'Livro não encontrado.' });
   }
   const bookId = Number(req.params.id);
   if (stars === 0) {
-    db.prepare('DELETE FROM ratings WHERE user_id = ? AND book_id = ?').run(req.user.id, bookId);
-    unnotify('rating', req.user.id, { bookId });
+    await db.prepare('DELETE FROM ratings WHERE user_id = ? AND book_id = ?').run(req.user.id, bookId);
+    await unnotify('rating', req.user.id, { bookId });
   } else {
-    db.prepare(
+    await db.prepare(
       `INSERT INTO ratings (user_id, book_id, stars) VALUES (?, ?, ?)
        ON CONFLICT(user_id, book_id) DO UPDATE SET stars = excluded.stars`
     ).run(req.user.id, bookId, stars);
-    notify('rating', req.user.id, { bookId, extra: String(stars) });
+    await notify('rating', req.user.id, { bookId, extra: String(stars) });
   }
-  const r = db
+  const r = await db
     .prepare('SELECT ROUND(AVG(stars), 1) AS avg, COUNT(*) AS n FROM ratings WHERE book_id = ?')
     .get(req.params.id);
   res.json({ my_rating: stars, rating_avg: r.avg, rating_count: r.n });
@@ -701,7 +709,7 @@ app.post('/api/books/:id/rating', requireAuth, (req, res) => {
 
 // Capa como imagem própria (serve fotos tiradas pelo usuário e é usada na prévia do link compartilhado)
 app.get('/api/books/:id/cover', wrap(async (req, res) => {
-  const row = db.prepare('SELECT id, cover_url FROM books WHERE id = ?').get(req.params.id);
+  const row = await db.prepare('SELECT id, cover_url FROM books WHERE id = ?').get(req.params.id);
   const file = row && (await ensureCover(row.id, row.cover_url));
   if (!file) return res.status(404).end(); // o site mostra a capa desenhada
   // o ?v= muda quando a capa é trocada, então pode guardar por bastante tempo
@@ -709,61 +717,61 @@ app.get('/api/books/:id/cover', wrap(async (req, res) => {
   res.sendFile(file);
 }));
 
-app.delete('/api/books/:id', requireAuth, (req, res) => {
-  const r = db.prepare('DELETE FROM books WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
+app.delete('/api/books/:id', requireAuth, async (req, res) => {
+  const r = await db.prepare('DELETE FROM books WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
   if (!r.changes) return res.status(404).json({ error: 'Livro não encontrado.' });
   res.json({ ok: true });
 });
 
-app.post('/api/books/:id/favorite', requireAuth, (req, res) => {
-  if (!db.prepare('SELECT 1 FROM books WHERE id = ?').get(req.params.id)) {
+app.post('/api/books/:id/favorite', requireAuth, async (req, res) => {
+  if (!await db.prepare('SELECT 1 FROM books WHERE id = ?').get(req.params.id)) {
     return res.status(404).json({ error: 'Livro não encontrado.' });
   }
-  const exists = db.prepare('SELECT 1 FROM favorites WHERE user_id = ? AND book_id = ?').get(req.user.id, req.params.id);
+  const exists = await db.prepare('SELECT 1 FROM favorites WHERE user_id = ? AND book_id = ?').get(req.user.id, req.params.id);
   const bookId = Number(req.params.id);
   if (exists) {
-    db.prepare('DELETE FROM favorites WHERE user_id = ? AND book_id = ?').run(req.user.id, bookId);
-    unnotify('favorite', req.user.id, { bookId });
+    await db.prepare('DELETE FROM favorites WHERE user_id = ? AND book_id = ?').run(req.user.id, bookId);
+    await unnotify('favorite', req.user.id, { bookId });
   } else {
-    db.prepare('INSERT INTO favorites (user_id, book_id) VALUES (?, ?)').run(req.user.id, bookId);
-    notify('favorite', req.user.id, { bookId });
+    await db.prepare('INSERT INTO favorites (user_id, book_id) VALUES (?, ?)').run(req.user.id, bookId);
+    await notify('favorite', req.user.id, { bookId });
   }
-  const { n } = db.prepare('SELECT COUNT(*) AS n FROM favorites WHERE book_id = ?').get(req.params.id);
+  const { n } = await db.prepare('SELECT COUNT(*) AS n FROM favorites WHERE book_id = ?').get(req.params.id);
   res.json({ favorited: !exists, favorite_count: n });
 });
 
-app.post('/api/books/:id/like', requireAuth, (req, res) => {
-  const exists = db.prepare('SELECT 1 FROM likes WHERE user_id = ? AND book_id = ?').get(req.user.id, req.params.id);
+app.post('/api/books/:id/like', requireAuth, async (req, res) => {
+  const exists = await db.prepare('SELECT 1 FROM likes WHERE user_id = ? AND book_id = ?').get(req.user.id, req.params.id);
   const bookId = Number(req.params.id);
   if (exists) {
-    db.prepare('DELETE FROM likes WHERE user_id = ? AND book_id = ?').run(req.user.id, bookId);
-    unnotify('like', req.user.id, { bookId });
+    await db.prepare('DELETE FROM likes WHERE user_id = ? AND book_id = ?').run(req.user.id, bookId);
+    await unnotify('like', req.user.id, { bookId });
   } else {
-    db.prepare('INSERT INTO likes (user_id, book_id) VALUES (?, ?)').run(req.user.id, bookId);
-    notify('like', req.user.id, { bookId });
+    await db.prepare('INSERT INTO likes (user_id, book_id) VALUES (?, ?)').run(req.user.id, bookId);
+    await notify('like', req.user.id, { bookId });
   }
-  const { n } = db.prepare('SELECT COUNT(*) AS n FROM likes WHERE book_id = ?').get(req.params.id);
+  const { n } = await db.prepare('SELECT COUNT(*) AS n FROM likes WHERE book_id = ?').get(req.params.id);
   res.json({ liked: !exists, like_count: n });
 });
 
-app.post('/api/books/:id/comments', requireAuth, (req, res) => {
+app.post('/api/books/:id/comments', requireAuth, async (req, res) => {
   const text = String(req.body.text || '').trim().slice(0, 1000);
   if (!text) return res.status(400).json({ error: 'Escreva um comentário.' });
-  if (!db.prepare('SELECT 1 FROM books WHERE id = ?').get(req.params.id)) {
+  if (!await db.prepare('SELECT 1 FROM books WHERE id = ?').get(req.params.id)) {
     return res.status(404).json({ error: 'Livro não encontrado.' });
   }
-  const { lastInsertRowid } = db
+  const { lastInsertRowid } = await db
     .prepare('INSERT INTO comments (user_id, book_id, text) VALUES (?, ?, ?)')
     .run(req.user.id, req.params.id, text);
-  notify('comment', req.user.id, { bookId: Number(req.params.id), extra: text });
+  await notify('comment', req.user.id, { bookId: Number(req.params.id), extra: text });
   res.json({
     comment: { id: Number(lastInsertRowid), text, created_at: new Date().toISOString(), user_id: req.user.id, username: req.user.username, name: req.user.name },
   });
 });
 
-app.delete('/api/comments/:id', requireAuth, (req, res) => {
+app.delete('/api/comments/:id', requireAuth, async (req, res) => {
   // Pode apagar quem escreveu ou o dono do livro
-  const r = db
+  const r = await db
     .prepare(
       `DELETE FROM comments WHERE id = ? AND (user_id = ? OR book_id IN (SELECT id FROM books WHERE user_id = ?))`
     )
@@ -772,9 +780,9 @@ app.delete('/api/comments/:id', requireAuth, (req, res) => {
 });
 
 // ----- Usuários e seguidores -----
-app.get('/api/users', (req, res) => {
+app.get('/api/users', async (req, res) => {
   const q = `%${String(req.query.q || '').trim()}%`;
-  const users = db
+  const users = await db
     .prepare(
       `SELECT u.username, u.name, u.bio, u.avatar, (SELECT COUNT(*) FROM books b WHERE b.user_id = u.id) AS book_count,
          EXISTS(SELECT 1 FROM follows f WHERE f.following_id = u.id AND f.follower_id = ?) AS is_following
@@ -784,20 +792,20 @@ app.get('/api/users', (req, res) => {
   res.json({ users });
 });
 
-app.get('/api/users/:username', (req, res) => {
-  const user = db.prepare('SELECT id, username, name, bio, avatar, shelf_style, banner, created_at FROM users WHERE username = ?').get(req.params.username);
+app.get('/api/users/:username', async (req, res) => {
+  const user = await db.prepare('SELECT id, username, name, bio, avatar, shelf_style, banner, created_at FROM users WHERE username = ?').get(req.params.username);
   if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
   const me = req.user?.id ?? 0;
-  const stats = db
+  const stats = await db
     .prepare(
       `SELECT (SELECT COUNT(*) FROM follows WHERE following_id = ?) AS followers,
               (SELECT COUNT(*) FROM follows WHERE follower_id = ?) AS following,
               EXISTS(SELECT 1 FROM follows WHERE follower_id = ? AND following_id = ?) AS is_following`
     )
     .get(user.id, user.id, me, user.id);
-  const books = db.prepare(`${BOOK_SELECT} WHERE b.user_id = ?
+  const books = await db.prepare(`${BOOK_SELECT} WHERE b.user_id = ?
      ORDER BY b.position IS NULL, b.position, b.created_at DESC, b.id DESC`).all(me, me, user.id);
-  const favorites = db
+  const favorites = await db
     .prepare(
       `${BOOK_SELECT} JOIN favorites fav ON fav.book_id = b.id AND fav.user_id = ?
        ORDER BY fav.created_at DESC, b.id DESC`
@@ -806,47 +814,47 @@ app.get('/api/users/:username', (req, res) => {
   res.json({ user: { ...user, banner: bannerOut(user), ...stats, is_following: Boolean(stats.is_following) }, books, favorites });
 });
 
-app.get('/api/users/:username/:list(followers|following)', (req, res) => {
-  const user = db.prepare('SELECT id FROM users WHERE username = ?').get(req.params.username);
+app.get('/api/users/:username/:list(followers|following)', async (req, res) => {
+  const user = await db.prepare('SELECT id FROM users WHERE username = ?').get(req.params.username);
   if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
   const sql =
     req.params.list === 'followers'
       ? 'SELECT u.username, u.name, u.avatar FROM follows f JOIN users u ON u.id = f.follower_id WHERE f.following_id = ?'
       : 'SELECT u.username, u.name, u.avatar FROM follows f JOIN users u ON u.id = f.following_id WHERE f.follower_id = ?';
-  res.json({ users: db.prepare(sql).all(user.id) });
+  res.json({ users: await db.prepare(sql).all(user.id) });
 });
 
-app.post('/api/users/:username/follow', requireAuth, (req, res) => {
-  const target = db.prepare('SELECT id FROM users WHERE username = ?').get(req.params.username);
+app.post('/api/users/:username/follow', requireAuth, async (req, res) => {
+  const target = await db.prepare('SELECT id FROM users WHERE username = ?').get(req.params.username);
   if (!target) return res.status(404).json({ error: 'Usuário não encontrado.' });
   if (target.id === req.user.id) return res.status(400).json({ error: 'Você não pode seguir a si mesmo.' });
-  const exists = db.prepare('SELECT 1 FROM follows WHERE follower_id = ? AND following_id = ?').get(req.user.id, target.id);
+  const exists = await db.prepare('SELECT 1 FROM follows WHERE follower_id = ? AND following_id = ?').get(req.user.id, target.id);
   if (exists) {
-    db.prepare('DELETE FROM follows WHERE follower_id = ? AND following_id = ?').run(req.user.id, target.id);
-    unnotify('follow', req.user.id, { userId: target.id });
+    await db.prepare('DELETE FROM follows WHERE follower_id = ? AND following_id = ?').run(req.user.id, target.id);
+    await unnotify('follow', req.user.id, { userId: target.id });
   } else {
-    db.prepare('INSERT INTO follows (follower_id, following_id) VALUES (?, ?)').run(req.user.id, target.id);
-    notify('follow', req.user.id, { userId: target.id });
+    await db.prepare('INSERT INTO follows (follower_id, following_id) VALUES (?, ?)').run(req.user.id, target.id);
+    await notify('follow', req.user.id, { userId: target.id });
   }
-  const { n } = db.prepare('SELECT COUNT(*) AS n FROM follows WHERE following_id = ?').get(target.id);
+  const { n } = await db.prepare('SELECT COUNT(*) AS n FROM follows WHERE following_id = ?').get(target.id);
   res.json({ is_following: !exists, followers: n });
 });
 
 // Feed: livros de quem você segue (ou todos os recentes, se não segue ninguém)
-app.get('/api/feed', (req, res) => {
+app.get('/api/feed', async (req, res) => {
   const me = req.user?.id ?? 0;
   let books = [];
   if (me) {
-    books = db
+    books = await db
       .prepare(
         `${BOOK_SELECT} WHERE b.user_id IN (SELECT following_id FROM follows WHERE follower_id = ?)
          ORDER BY b.created_at DESC, b.id DESC LIMIT 60`
       )
       .all(me, me, me);
   }
-  const recent = db.prepare(`${BOOK_SELECT} ORDER BY b.created_at DESC, b.id DESC LIMIT 60`).all(me, me);
+  const recent = await db.prepare(`${BOOK_SELECT} ORDER BY b.created_at DESC, b.id DESC LIMIT 60`).all(me, me);
   // Em alta: curtidas, favoritos, comentários e notas (com peso maior para os últimos 30 dias)
-  const trending = db
+  const trending = await db
     .prepare(
       `${BOOK_SELECT}
        WHERE EXISTS (SELECT 1 FROM likes l WHERE l.book_id = b.id) OR EXISTS (SELECT 1 FROM favorites f WHERE f.book_id = b.id)
@@ -857,7 +865,8 @@ app.get('/api/feed', (req, res) => {
     )
     .all(me, me);
   // Leitores para conhecer: quem você ainda não segue, com mais livros
-  const people = db
+  const people = (
+    await db
     .prepare(
       `SELECT u.username, u.name, u.avatar, u.bio, (SELECT COUNT(*) FROM books b WHERE b.user_id = u.id) AS book_count
        FROM users u
@@ -865,8 +874,8 @@ app.get('/api/feed', (req, res) => {
        ORDER BY book_count DESC, u.id DESC LIMIT 8`
     )
     .all(me, me)
-    .filter((u) => u.book_count > 0);
-  const stats = db
+  ).filter((u) => u.book_count > 0);
+  const stats = await db
     .prepare('SELECT (SELECT COUNT(*) FROM books) AS books, (SELECT COUNT(*) FROM users) AS readers, (SELECT COUNT(*) FROM comments) AS comments')
     .get();
   res.json({ following: books, recent, trending, people, stats });
@@ -964,11 +973,11 @@ app.get('/api/online-search', wrap(async (req, res) => {
 }));
 
 // ----- Atividade de quem você segue (feed da página inicial) -----
-app.get('/api/activity', requireAuth, (req, res) => {
+app.get('/api/activity', requireAuth, async (req, res) => {
   const cover = `CASE WHEN b.cover_url = '' OR b.cover_url IS NULL OR b.cover_ok = 0 THEN '' ELSE '/api/books/' || b.id || '/cover?v=' || COALESCE(b.cover_v, 0) END`;
   const bookCols = `b.id AS book_id, b.title, b.authors, b.format, ${cover} AS cover_url, o.username AS owner_username`;
   const who = 'u.username, u.name, u.avatar';
-  const items = db
+  const items = await db
     .prepare(
       `SELECT * FROM (
          SELECT 'add' AS type, b.created_at AS at, '' AS extra, ${who}, ${bookCols}
@@ -993,13 +1002,13 @@ app.get('/api/activity', requireAuth, (req, res) => {
 });
 
 // ----- Notificações -----
-app.get('/api/notifications/count', requireAuth, (req, res) => {
-  const { n } = db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND read_at IS NULL').get(req.user.id);
+app.get('/api/notifications/count', requireAuth, async (req, res) => {
+  const { n } = await db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND read_at IS NULL').get(req.user.id);
   res.json({ unread: n });
 });
 
-app.get('/api/notifications', requireAuth, (req, res) => {
-  const items = db
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  const items = await db
     .prepare(
       `SELECT n.id, n.type, n.extra, n.created_at, n.read_at, n.book_id,
               u.username, u.name, u.avatar,
@@ -1016,8 +1025,8 @@ app.get('/api/notifications', requireAuth, (req, res) => {
   res.json({ items });
 });
 
-app.post('/api/notifications/read', requireAuth, (req, res) => {
-  db.prepare("UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE user_id = ? AND read_at IS NULL").run(req.user.id);
+app.post('/api/notifications/read', requireAuth, async (req, res) => {
+  await db.prepare("UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE user_id = ? AND read_at IS NULL").run(req.user.id);
   res.json({ ok: true });
 });
 
@@ -1034,8 +1043,8 @@ const titleKey = (t) => norm(String(t || '').split(/[:(\-–—]/)[0]);
 const firstAuthor = (a) => String(a || '').split(',')[0].trim();
 const nice = (s) => String(s || '').trim().replace(/^./, (c) => c.toUpperCase());
 
-function shelfProfile(userId) {
-  const books = db.prepare('SELECT id, title, authors, genre, pages, year FROM books WHERE user_id = ?').all(userId);
+async function shelfProfile(userId) {
+  const books = await db.prepare('SELECT id, title, authors, genre, pages, year FROM books WHERE user_id = ?').all(userId);
   const genres = new Map();
   const authors = new Map();
   let pages = 0;
@@ -1080,9 +1089,9 @@ function fallbackPersona(topGenres) {
 }
 
 app.get('/api/users/:username/dna', wrap(async (req, res) => {
-  const user = db.prepare('SELECT id, name FROM users WHERE username = ?').get(req.params.username);
+  const user = await db.prepare('SELECT id, name FROM users WHERE username = ?').get(req.params.username);
   if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
-  const p = shelfProfile(user.id);
+  const p = await shelfProfile(user.id);
   const total = p.books.length;
   const genres = [...p.genres.values()].sort((a, b) => b.count - a.count);
   const withGenre = genres.reduce((n, g) => n + g.count, 0) || 1;
@@ -1101,7 +1110,7 @@ app.get('/api/users/:username/dna', wrap(async (req, res) => {
       .createHash('sha1')
       .update(p.books.map((b) => `${b.id}:${norm(b.genre)}`).sort().join('|'))
       .digest('hex');
-    const cached = db.prepare('SELECT signature, persona FROM dna_cache WHERE user_id = ?').get(user.id);
+    const cached = await db.prepare('SELECT signature, persona FROM dna_cache WHERE user_id = ?').get(user.id);
     if (cached?.signature === signature) persona = JSON.parse(cached.persona);
     else {
       const ai = await askAI([
@@ -1125,7 +1134,7 @@ app.get('/api/users/:username/dna', wrap(async (req, res) => {
           ? { emoji: String(ai.emoji || '📚').slice(0, 4), title: String(ai.title).slice(0, 60), text: String(ai.text).slice(0, 400) }
           : fallbackPersona(topGenres);
       if (ai?.title) {
-        db.prepare(
+        await db.prepare(
           'INSERT INTO dna_cache (user_id, signature, persona) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET signature = excluded.signature, persona = excluded.persona'
         ).run(user.id, signature, JSON.stringify(persona));
       }
@@ -1135,12 +1144,12 @@ app.get('/api/users/:username/dna', wrap(async (req, res) => {
 }));
 
 // Compatibilidade entre quem está vendo e o dono da estante
-app.get('/api/users/:username/match', requireAuth, (req, res) => {
-  const other = db.prepare('SELECT id, name FROM users WHERE username = ?').get(req.params.username);
+app.get('/api/users/:username/match', requireAuth, async (req, res) => {
+  const other = await db.prepare('SELECT id, name FROM users WHERE username = ?').get(req.params.username);
   if (!other) return res.status(404).json({ error: 'Usuário não encontrado.' });
   if (other.id === req.user.id) return res.json({ score: null });
-  const a = shelfProfile(req.user.id);
-  const b = shelfProfile(other.id);
+  const a = await shelfProfile(req.user.id);
+  const b = await shelfProfile(other.id);
   if (!a.books.length || !b.books.length) return res.json({ score: null, reason: a.books.length ? 'other-empty' : 'me-empty' });
 
   const titlesA = new Map(a.books.map((x) => [titleKey(x.title), x.title]));
@@ -1167,13 +1176,13 @@ app.get('/api/users/:username/match', requireAuth, (req, res) => {
 });
 
 // Recomendações: livros das estantes de outras pessoas que combinam com a sua
-app.get('/api/recommendations', requireAuth, (req, res) => {
+app.get('/api/recommendations', requireAuth, async (req, res) => {
   const me = req.user.id;
-  const p = shelfProfile(me);
+  const p = await shelfProfile(me);
   const mine = new Set(p.books.map((b) => titleKey(b.title)));
   const totalGenres = [...p.genres.values()].reduce((n, g) => n + g.count, 0) || 1;
-  const following = new Set(db.prepare('SELECT following_id AS id FROM follows WHERE follower_id = ?').all(me).map((r) => r.id));
-  const candidates = db.prepare(`${BOOK_SELECT} WHERE b.user_id <> ? ORDER BY b.created_at DESC LIMIT 600`).all(me, me, me);
+  const following = new Set((await db.prepare('SELECT following_id AS id FROM follows WHERE follower_id = ?').all(me)).map((r) => r.id));
+  const candidates = await db.prepare(`${BOOK_SELECT} WHERE b.user_id <> ? ORDER BY b.created_at DESC LIMIT 600`).all(me, me, me);
 
   const best = new Map();
   for (const b of candidates) {
@@ -1227,8 +1236,8 @@ function sendWithPreview(req, res, { title, description, image }) {
   res.type('html').send(html);
 }
 
-app.get('/l/:id', (req, res) => {
-  const b = db
+app.get('/l/:id', async (req, res) => {
+  const b = await db
     .prepare('SELECT b.id, b.title, b.authors, b.description, b.cover_url, u.name FROM books b JOIN users u ON u.id = b.user_id WHERE b.id = ?')
     .get(req.params.id);
   if (!b) return res.redirect('/');
@@ -1241,25 +1250,25 @@ app.get('/l/:id', (req, res) => {
 
 // Imagem da estante para a prévia do link (gerada na hora e guardada em cache)
 app.get('/api/users/:username/shelf.jpg', wrap(async (req, res) => {
-  const user = db.prepare('SELECT id, username, name FROM users WHERE username = ?').get(req.params.username);
+  const user = await db.prepare('SELECT id, username, name FROM users WHERE username = ?').get(req.params.username);
   if (!user) return res.status(404).end();
-  const books = db
+  const books = await db
     .prepare(
       `SELECT id, title, authors, cover_url FROM books WHERE user_id = ?
        ORDER BY position IS NULL, position, created_at DESC, id DESC LIMIT 5`
     )
     .all(user.id);
-  const { n } = db.prepare('SELECT COUNT(*) AS n FROM books WHERE user_id = ?').get(user.id);
+  const { n } = await db.prepare('SELECT COUNT(*) AS n FROM books WHERE user_id = ?').get(user.id);
   const img = await shelfImage(user, books, n);
   res.setHeader('Content-Type', 'image/jpeg');
   res.setHeader('Cache-Control', 'public, max-age=600');
   res.end(img);
 }));
 
-app.get('/u/:username', (req, res) => {
-  const u = db.prepare('SELECT id, name, username, bio FROM users WHERE username = ?').get(req.params.username);
+app.get('/u/:username', async (req, res) => {
+  const u = await db.prepare('SELECT id, name, username, bio FROM users WHERE username = ?').get(req.params.username);
   if (!u) return res.redirect('/');
-  const { n } = db.prepare('SELECT COUNT(*) AS n FROM books WHERE user_id = ?').get(u.id);
+  const { n } = await db.prepare('SELECT COUNT(*) AS n FROM books WHERE user_id = ?').get(u.id);
   sendWithPreview(req, res, {
     title: `Estante de ${u.name} (@${u.username}) · Capa Dura`,
     description: u.bio || `${n} ${n === 1 ? 'livro' : 'livros'} na estante. Venha ver, curtir e comentar!`,
@@ -1270,19 +1279,35 @@ app.get('/u/:username', (req, res) => {
 
 app.get(/^\/(?!api\/).*/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-// ---------- Inicialização ----------
-// baixa em segundo plano as capas que ainda não estão no cache
-setTimeout(() => warmCovers(db.prepare("SELECT id, cover_url FROM books WHERE cover_url <> '' AND cover_ok IS NOT 0").all()).catch(() => {}), 1500);
-
-http.createServer(app).listen(PORT, () => {
-  console.log(`📚 Capa Dura rodando em http://localhost:${PORT}`);
-  if (!GROQ_API_KEY) console.warn('⚠️  GROQ_API_KEY não definida — o cadastro automático não vai funcionar.');
+// Erros inesperados: resposta amigável, sem detalhes técnicos
+app.use((err, req, res, next) => {
+  console.error(err);
+  if (res.headersSent) return next(err);
+  res.status(err.status === 413 ? 413 : 500).json({
+    error: err.status === 413 ? 'Arquivo grande demais. Tente uma foto menor.' : 'Algo não saiu como esperado. Aguarde um instante e tente de novo.',
+  });
 });
 
-// HTTPS (necessário para abrir a câmera pelo celular na rede local)
-const certDir = path.join(__dirname, 'certs');
-if (fs.existsSync(path.join(certDir, 'key.pem')) && fs.existsSync(path.join(certDir, 'cert.pem'))) {
-  https
-    .createServer({ key: fs.readFileSync(path.join(certDir, 'key.pem')), cert: fs.readFileSync(path.join(certDir, 'cert.pem')) }, app)
-    .listen(HTTPS_PORT, () => console.log(`🔒 HTTPS em https://<ip-do-computador>:${HTTPS_PORT} (use no celular)`));
+module.exports = app;
+
+// ---------- Inicialização (só quando roda como servidor: npm start) ----------
+if (require.main === module) {
+  // baixa em segundo plano as capas que ainda não estão no cache
+  setTimeout(async () => {
+    await ready;
+    warmCovers(await db.prepare("SELECT id, cover_url FROM books WHERE cover_url <> '' AND cover_ok IS NOT 0").all()).catch(() => {});
+  }, 1500);
+
+  http.createServer(app).listen(PORT, () => {
+    console.log(`📚 Capa Dura rodando em http://localhost:${PORT}${db.remote ? ' (banco: Turso)' : ''}`);
+    if (!GROQ_API_KEY) console.warn('⚠️  GROQ_API_KEY não definida — o cadastro automático não vai funcionar.');
+  });
+
+  // HTTPS (necessário para abrir a câmera pelo celular na rede local)
+  const certDir = path.join(__dirname, 'certs');
+  if (fs.existsSync(path.join(certDir, 'key.pem')) && fs.existsSync(path.join(certDir, 'cert.pem'))) {
+    https
+      .createServer({ key: fs.readFileSync(path.join(certDir, 'key.pem')), cert: fs.readFileSync(path.join(certDir, 'cert.pem')) }, app)
+      .listen(HTTPS_PORT, () => console.log(`🔒 HTTPS em https://<ip-do-computador>:${HTTPS_PORT} (use no celular)`));
+  }
 }

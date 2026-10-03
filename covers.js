@@ -5,7 +5,9 @@ const path = require('path');
 const sharp = require('sharp');
 
 // fica junto do banco de dados (cada banco tem sua própria pasta de capas)
-const DIR = process.env.COVERS_DIR || (process.env.DB_PATH ? path.join(path.dirname(process.env.DB_PATH), 'covers') : path.join(__dirname, 'data', 'covers'));
+const DIR =
+  process.env.COVERS_DIR ||
+  (process.env.VERCEL ? '/tmp/covers' : process.env.DB_PATH ? path.join(path.dirname(process.env.DB_PATH), 'covers') : path.join(__dirname, 'data', 'covers'));
 fs.mkdirSync(DIR, { recursive: true });
 
 const fileFor = (id) => path.join(DIR, `${Number(id)}.jpg`);

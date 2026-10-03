@@ -957,7 +957,7 @@ function pickBannerImage() {
       if (!file) return resolve(null);
       const img = new Image();
       img.onload = () => {
-        const scale = Math.min(1, 2200 / img.naturalWidth);
+        const scale = Math.min(1, 1800 / img.naturalWidth); // cabe no limite de envio da Vercel (4,5 MB)
         const c = document.createElement('canvas');
         c.width = Math.round(img.naturalWidth * scale);
         c.height = Math.round(img.naturalHeight * scale);
