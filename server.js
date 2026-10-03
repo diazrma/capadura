@@ -22,6 +22,11 @@ const VISION_MODELS = modelList(process.env.GROQ_VISION_MODEL, process.env.GROQ_
 
 // ---------- Banco de dados ----------
 // Cria as tabelas e aplica as migrações uma vez por processo (na Vercel, a cada "cold start")
+console.log('TURSO:', {
+  url: process.env.TURSO_DATABASE_URL,
+  tokenExists: Boolean(process.env.TURSO_AUTH_TOKEN),
+  tokenLength: process.env.TURSO_AUTH_TOKEN?.length,
+});
 async function initDb() {
 await db.exec(`
   PRAGMA journal_mode = WAL;
